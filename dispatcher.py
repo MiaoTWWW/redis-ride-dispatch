@@ -1,0 +1,207 @@
+"""派車服務（可同時開多個，靠 Consumer Group 自動分工）
+
+三件事同時進行：
+  1. consume ：XREADGROUP 取叫車請求 → GEOSEARCH 找最近空車 → Lua 原子派單
+  2. expired ：訂閱 key 過期通知 → offer 逾時改派、司機心跳過期下線
+  3. sweep   ：每秒搬延遲佇列、補掃漏掉的逾時、XAUTOCLAIM 接手掛掉的 dispatcher 留下的請求
+
+用法：
+    python dispatcher.py --name dispatcher-1
+"""
+import argparse
+import asyncio
+import json
+import time
+
+from redis.exceptions import ResponseError
+
+import config as C
+
+
+class Dispatcher:
+    def __init__(self, args):
+        self.name = args.name
+        self.slow = args.slow
+        self.claim_idle = args.claim_idle
+        self.n = {"offer": 0, "expand": 0, "fail": 0, "timeout": 0, "offline": 0, "claimed": 0}
+
+    def log(self, msg):
+        print(f"[{time.strftime('%H:%M:%S')}] {self.name} {msg}", flush=True)
+
+    async def setup(self):
+        self.r = C.get_redis()
+        self.lua = C.Lua(self.r)
+        await self.r.ping()
+        await C.ensure_group(self.r)
+        # 開啟 key 過期通知（E=keyevent, x=expired）
+        await self.r.config_set("notify-keyspace-events", "Ex")
+
+    # ───────── 1. 取請求、找車、派單 ─────────
+    async def consume(self):
+        while True:
+            try:
+                resp = await self.r.xreadgroup(C.GROUP, self.name, {C.STREAM_REQUESTS: ">"}, count=1, block=2000)
+            except ResponseError as e:
+                if "NOGROUP" not in str(e):
+                    raise
+                await C.ensure_group(self.r)  # 資料庫被清空過（reset.py），重建群組後繼續
+                continue
+            for _, msgs in resp or []:
+                for mid, f in msgs:
+                    await self.process(mid, f)
+
+    async def process(self, mid, f):
+        try:
+            if self.slow:
+                self.log(f"取得 #{f.get('tid')}，處理中（--slow {self.slow}s）…")
+                await asyncio.sleep(self.slow)
+            await self.handle(f["tid"])
+        except Exception as e:  # 單筆失敗不影響整個服務
+            self.log(f"處理 {mid} 發生錯誤：{e!r}")
+        await self.r.xack(C.STREAM_REQUESTS, C.GROUP, mid)
+
+    async def handle(self, tid):
+        status, plon, plat, stage = await self.r.hmget(C.k_trip(tid), "status", "pickup_lon", "pickup_lat", "stage")
+        if status != "searching":
+            return  # 重複的訊息或行程已被處理
+        stage = int(stage or 0)
+        radius = C.RADII_KM[min(stage, len(C.RADII_KM) - 1)]
+
+        tried = await self.r.smembers(C.k_tried(tid))
+        found = await self.r.geosearch(C.DRIVERS_AVAILABLE, longitude=float(plon), latitude=float(plat),
+                                       radius=radius, unit="km", sort="ASC",
+                                       count=C.CANDIDATES + len(tried), withdist=True)
+        cands = [(m, d) for m, d in found if m not in tried][:C.CANDIDATES]
+
+        skipped = []
+        for did, dist in cands:
+            code, info = await self.lua.dispatch(did, tid)
+            if code == 1:
+                self.n["offer"] += 1
+                await self.r.xadd(C.STREAM_DISPATCH_LOG, {
+                    "tid": tid, "driver": did, "dist_km": f"{dist:.3f}", "radius": radius,
+                    "cands": ",".join(m for m, _ in cands), "skipped": ",".join(skipped),
+                    "atomic_nearest": info, "by": self.name}, maxlen=200000, approximate=True)
+                self.log(f"#{tid} → {did}（{dist * 1000:.0f} m，半徑 {radius} km"
+                         + (f"，前 {len(skipped)} 位已被搶走" if skipped else "") + "）")
+                return
+            if code == -1:
+                return
+            skipped.append(did)
+
+        # 這個半徑內沒車（或 5 位候選都被搶走）→ 擴大半徑，排進延遲佇列
+        nxt = stage + 1
+        if nxt < len(C.RADII_KM):
+            sec, usec = await self.r.time()
+            pipe = self.r.pipeline(transaction=True)
+            pipe.hset(C.k_trip(tid), "stage", nxt)
+            pipe.zadd(C.QUEUE_DELAYED, {f"{tid}:{nxt}": sec * 1000 + usec // 1000 + C.RETRY_DELAY_MS})
+            pipe.publish(C.k_ch_trip(tid), json.dumps({"type": "trip", "ev": "expanding", "tid": tid,
+                                                       "radius": C.RADII_KM[nxt]}))
+            await pipe.execute()
+            self.n["expand"] += 1
+            self.log(f"#{tid} 半徑 {radius} km 內沒有空車，{C.RETRY_DELAY_MS / 1000:g} 秒後改搜 {C.RADII_KM[nxt]} km")
+        elif await self.lua.fail(tid) == 1:
+            self.n["fail"] += 1
+            self.log(f"#{tid} 找不到車，標記 failed")
+
+    # ───────── 2. key 過期通知 ─────────
+    async def listen_expired(self):
+        p = self.r.pubsub()
+        await p.subscribe("__keyevent@0__:expired")
+        async for m in p.listen():
+            if m["type"] != "message":
+                continue
+            key = m["data"]
+            try:
+                if key.startswith("offer:"):
+                    await self.on_offer_timeout(key[6:])
+                elif key.startswith("driver:alive:"):
+                    await self.on_driver_offline(key[13:])
+            except Exception as e:
+                self.log(f"處理過期事件 {key} 發生錯誤：{e!r}")
+
+    async def on_offer_timeout(self, tid):
+        # 過期通知只給 key 名稱、值已經消失，所以司機 id 要從 trip:{tid} 讀
+        did = await self.r.hget(C.k_trip(tid), "driver")
+        if did and await self.lua.release(did, tid, "timeout") == 1:
+            self.n["timeout"] += 1
+            self.log(f"#{tid} {did} 超過 {C.OFFER_TTL} 秒沒接單 → 改派")
+
+    async def on_driver_offline(self, did):
+        for _ in range(3):
+            tid = await self.r.hget(C.k_driver(did), "trip") or ""
+            res = await self.lua.offline(did, tid)
+            if res == 1:
+                self.n["offline"] += 1
+                self.log(f"{did} 心跳過期 → 離線" + (f"，行程 #{tid} 重新處理" if tid else ""))
+            if res != -1:
+                return
+
+    # ───────── 3. 定期巡檢 ─────────
+    async def sweep(self):
+        i = 0
+        while True:
+            await asyncio.sleep(1)
+            i += 1
+            try:
+                await self.lua.promote()  # 延遲佇列到期的請求搬回 Stream
+
+                # 過期通知是「盡力而為」，不保證送達：用期限 ZSet 補掃
+                sec, usec = await self.r.time()
+                now = sec * 1000 + usec // 1000
+                for tid in await self.r.zrangebyscore(C.TRIPS_OFFERED, 0, now - 1500, start=0, num=50):
+                    await self.on_offer_timeout(tid)
+                    if await self.r.hget(C.k_trip(tid), "status") != "offered":
+                        await self.r.zrem(C.TRIPS_OFFERED, tid)
+
+                # 故障接手：別的 dispatcher 取走卻太久沒 ACK 的請求，認領過來處理
+                _, claimed, *_ = await self.r.xautoclaim(C.STREAM_REQUESTS, C.GROUP, self.name,
+                                                        min_idle_time=self.claim_idle, start_id="0-0", count=20)
+                for mid, f in claimed:
+                    if f:
+                        self.n["claimed"] += 1
+                        self.log(f"接手 #{f.get('tid')}（原本的 dispatcher 超過 {self.claim_idle / 1000:g} 秒沒 ACK）")
+                        await self.handle(f["tid"])
+                    await self.r.xack(C.STREAM_REQUESTS, C.GROUP, mid)
+
+                if i % 5 == 0:  # 補掃漏掉的離線車輛
+                    ids = await self.r.zrange(C.DRIVERS_ALL, 0, -1)
+                    if ids:
+                        pipe = self.r.pipeline(transaction=False)
+                        for did in ids:
+                            pipe.exists(C.k_alive(did))
+                        for did, alive in zip(ids, await pipe.execute()):
+                            if not alive:
+                                await self.on_driver_offline(did)
+                if i % 30 == 0:
+                    n = self.n
+                    self.log(f"累計：派單 {n['offer']}｜擴大半徑 {n['expand']}｜失敗 {n['fail']}｜"
+                             f"逾時改派 {n['timeout']}｜離線 {n['offline']}｜接手 {n['claimed']}")
+            except Exception as e:
+                self.log(f"巡檢發生錯誤：{e!r}")
+
+    async def run(self):
+        await self.setup()
+        print("=" * 64)
+        print(f" 即時派車模擬系統 ─ 派車服務 {self.name}")
+        print(f" Redis: {C.REDIS_URL}｜Consumer Group: {C.GROUP}")
+        print("=" * 64, flush=True)
+        await asyncio.gather(self.consume(), self.listen_expired(), self.sweep())
+
+
+def main():
+    C.utf8_console()
+    ap = argparse.ArgumentParser(description="派車服務")
+    ap.add_argument("--name", default="dispatcher-1", help="consumer 名稱，每個視窗要不同")
+    ap.add_argument("--slow", type=float, default=0, help="每筆請求處理前先睡幾秒（展示故障接手用）")
+    ap.add_argument("--claim-idle", type=int, default=C.CLAIM_IDLE_MS, help="幾毫秒沒 ACK 就可被接手")
+    args = ap.parse_args()
+    try:
+        asyncio.run(Dispatcher(args).run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

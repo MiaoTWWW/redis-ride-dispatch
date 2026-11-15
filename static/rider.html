@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>叫車｜即時派車模擬系統</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="side">
+    <header class="top">
+      <h1>叫車</h1>
+      <a href="/dashboard" target="_blank" rel="noopener">開啟監控儀表板 ↗</a>
+    </header>
+    <div class="conn" id="conn"><i></i><span>連線中…</span></div>
+
+    <section class="card">
+      <h2>路線</h2>
+      <p class="hint" id="hint">在地圖上點一下，設定上車點。</p>
+      <div class="row"><span>上車點</span><b id="pickup">尚未設定</b></div>
+      <div class="row"><span>目的地</span><b id="dropoff">尚未設定</b></div>
+      <div class="row"><span>直線距離</span><b id="dist">–</b></div>
+      <div class="row"><span>預估車資</span><b id="est">–</b></div>
+    </section>
+
+    <div class="btns">
+      <button id="go" disabled>叫車</button>
+      <button id="rand" class="ghost">隨機路線</button>
+      <button id="clear" class="ghost">重設</button>
+    </div>
+    <div id="msg" class="msg" hidden role="status"></div>
+
+    <section class="card" id="tripCard" hidden>
+      <h2 id="tripTitle">行程</h2>
+      <ol class="steps" id="steps"></ol>
+      <div class="row"><span>司機</span><b id="tDriver">–</b></div>
+      <div class="row"><span>還有多遠</span><b id="tEta">–</b></div>
+      <div class="row"><span>車資</span><b id="tFare">–</b></div>
+    </section>
+
+    <section class="card">
+      <h2>圖例</h2>
+      <div class="legend">
+        <span><i style="background:var(--a)"></i>空車</span>
+        <span><i style="background:var(--o)"></i>待接單</span>
+        <span><i style="background:var(--p)"></i>前往載客</span>
+        <span><i style="background:var(--t)"></i>載客中</span>
+      </div>
+      <p class="hint" style="margin-top:8px">目前線上 <b id="online">0</b> 台車，其中 <b id="free">0</b> 台空車。</p>
+    </section>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/static/common.js"></script>
+<script>
+const map = makeMap();
+const cars = new CarLayer(map);
+const rider = (() => {
+  let id = null;
+  try { id = localStorage.getItem('rider'); } catch (e) {}
+  if (!id) { id = 'rider-' + Math.random().toString(36).slice(2, 8); try { localStorage.setItem('rider', id); } catch (e) {} }
+  return id;
+})();
+
+let pickup = null, dropoff = null, pMarker = null, dMarker = null, line = null, link = null;
+let trip = null, tripWs = null, poll = null, stations = [];
+
+const pin = (color, label) => L.divIcon({ className: '', iconSize: [26, 26], iconAnchor: [13, 13],
+  html: `<div style="width:26px;height:26px;border-radius:50%;background:${color};color:#fff;font:700 13px/26px sans-serif;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.4);border:2px solid #fff">${label}</div>` });
+
+function haversine(a, b) {
+  const R = 6371.0088, r = Math.PI / 180, dLat = (b.lat - a.lat) * r, dLon = (b.lng - a.lng) * r;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const near = (ll) => {
+  let best = null, bd = 1e9;
+  for (const s of stations) { const d = haversine(ll, { lat: s.lat, lng: s.lon }); if (d < bd) { bd = d; best = s; } }
+  return best && bd < 1.5 ? `${best.name}站附近` : `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
+};
+
+function say(text, kind) {
+  const el = $('msg');
+  el.hidden = !text; el.textContent = text || ''; el.className = 'msg' + (kind ? ' ' + kind : '');
+}
+
+function redraw() {
+  if (pMarker) pMarker.remove(); if (dMarker) dMarker.remove(); if (line) line.remove();
+  pMarker = dMarker = line = null;
+  const locked = !!trip;
+  if (pickup) {
+    pMarker = L.marker(pickup, { icon: pin('#111827', '上'), draggable: !locked }).addTo(map);
+    pMarker.on('dragend', () => { pickup = pMarker.getLatLng(); redraw(); });
+  }
+  if (dropoff) {
+    dMarker = L.marker(dropoff, { icon: pin('#dc2626', '下'), draggable: !locked }).addTo(map);
+    dMarker.on('dragend', () => { dropoff = dMarker.getLatLng(); redraw(); });
+  }
+  $('pickup').textContent = pickup ? near(pickup) : '尚未設定';
+  $('dropoff').textContent = dropoff ? near(dropoff) : '尚未設定';
+  if (pickup && dropoff) {
+    line = L.polyline([pickup, dropoff], { color: '#111827', weight: 3, dashArray: '6 8', opacity: .6 }).addTo(map);
+    const km = haversine(pickup, dropoff);
+    $('dist').textContent = km.toFixed(2) + ' km';
+    $('est').textContent = `約 ${Math.round(70 + 25 * km)} 元起`;
+  } else { $('dist').textContent = '–'; $('est').textContent = '–'; }
+  $('hint').textContent = locked ? '行程進行中，結束後可以再叫一台。'
+    : !pickup ? '在地圖上點一下，設定上車點。'
+    : !dropoff ? '再點一下，設定目的地。' : '可以拖曳圖釘微調，確認後按「叫車」。';
+  $('go').disabled = locked || !(pickup && dropoff);
+  $('rand').disabled = locked;
+}
+
+map.on('click', (e) => {
+  if (trip) return;
+  if (!pickup) pickup = e.latlng; else if (!dropoff) dropoff = e.latlng; else { pickup = e.latlng; dropoff = null; }
+  say(''); redraw();
+});
+
+const EV_STATUS = { expanding: 'searching', reject: 'searching', timeout: 'searching', driver_lost: 'searching',
+  offered: 'offered', assigned: 'to_pickup', picked_up: 'on_trip', completed: 'completed', failed: 'failed', aborted: 'aborted' };
+const STATUS_EV = { offered: 'offered', to_pickup: 'assigned', on_trip: 'picked_up', completed: 'completed', failed: 'failed', aborted: 'aborted' };
+
+// ── 行程時間軸 ──
+const steps = [];
+function step(text, sub, cls) {
+  steps.forEach(s => { if (s.cls === 'now') s.cls = 'done'; });
+  steps.push({ text, sub, cls: cls || 'now' });
+  $('steps').innerHTML = steps.map(s => `<li class="${s.cls}">${s.text}${s.sub ? `<small>${s.sub}</small>` : ''}</li>`).join('');
+}
+
+function finish() {
+  if (tripWs) { tripWs.close(); tripWs = null; }
+  clearInterval(poll); poll = null;
+  cars.focus = null; if (link) { link.remove(); link = null; }
+  trip = null; redraw();
+}
+
+function onTrip(m) {
+  if (!trip || String(m.tid) !== trip.tid) return;
+  // 同一個事件可能同時從 WebSocket 與狀態查詢各來一次，只處理第一次
+  const key = `${m.ev}:${m.driver || ''}`;
+  if (key === trip.lastKey) return;
+  trip.lastKey = key;
+  trip.status = EV_STATUS[m.ev] || trip.status;
+  switch (m.ev) {
+    case 'expanding': step(`附近沒有空車，擴大到 ${m.radius} 公里`, '系統會自動重試'); break;
+    case 'offered': trip.driver = m.driver; cars.focus = m.driver; $('tDriver').textContent = m.driver;
+      step(`已通知 ${m.driver}`, '等待司機接單，最多 10 秒'); break;
+    case 'reject': cars.focus = null; step(`${m.driver} 婉拒了`, '正在改派下一台'); break;
+    case 'timeout': cars.focus = null; step(`${m.driver} 沒有回應`, '已逾時，正在改派下一台'); break;
+    case 'driver_lost': cars.focus = null; step(`${m.driver} 斷線了`, '正在改派下一台'); break;
+    case 'assigned': step(`${m.driver} 已接單，正在過來`, `等了 ${(m.wait_ms / 1000).toFixed(1)} 秒`); break;
+    case 'picked_up': step('已上車，前往目的地'); break;
+    case 'completed': step(`已抵達，車資 ${m.fare} 元`, '', 'done');
+      say(`行程完成，車資 ${m.fare} 元。`, 'ok'); $('tEta').textContent = '已抵達'; finish(); break;
+    case 'failed': step('5 公里內都沒有空車', '請稍後再試', 'bad');
+      say('目前附近沒有空車，請稍後再叫一次。', 'err'); finish(); break;
+    case 'aborted': step('司機斷線，行程中止', '', 'bad'); say('司機斷線，行程已中止，請重新叫車。', 'err'); finish(); break;
+  }
+}
+
+function onMsg(m) {
+  if (m.type === 'map') {
+    cars.update(m.cars);
+    $('online').textContent = m.cars.length; $('free').textContent = cars.counts.a;
+    if (trip && trip.driver && cars.focus) {
+      const c = cars.get(trip.driver);
+      if (c) {
+        const goal = c.s === 't' ? dropoff : pickup;
+        if (link) link.remove();
+        link = L.polyline([[c.lat, c.lon], goal], { color: COLOR[c.s] || '#2563eb', weight: 3 }).addTo(map);
+      }
+    }
+  } else if (m.type === 'trip') onTrip(m);
+}
+
+async function refreshTrip() {
+  if (!trip) return;
+  const res = await fetch(`/api/trip/${trip.tid}`);
+  if (!res.ok || !trip) return;
+  const t = await res.json();
+  // Pub/Sub 不保留訊息：如果剛好漏接事件（例如連線切換的瞬間），用查到的狀態補上
+  if (t.status !== trip.status && STATUS_EV[t.status]) {
+    onTrip({ tid: trip.tid, ev: STATUS_EV[t.status], driver: t.driver, fare: Number(t.fare), wait_ms: Number(t.wait_ms || 0) });
+    if (!trip) return;
+  }
+  if (t.eta_s != null) {
+    const what = t.status === 'on_trip' ? '到目的地' : '到上車點';
+    $('tEta').textContent = `${what} ${t.remaining_km} km，約 ${t.eta_s < 60 ? t.eta_s + ' 秒' : Math.round(t.eta_s / 60) + ' 分鐘'}`;
+  }
+  if (t.driver) $('tDriver').textContent = t.driver + (t.driver_rating ? `（★ ${t.driver_rating}）` : '');
+}
+
+$('go').onclick = async () => {
+  $('go').disabled = true; say('送出叫車請求…');
+  let res;
+  try {
+    res = await fetch('/api/ride', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rider, pickup: { lon: pickup.lng, lat: pickup.lat }, dropoff: { lon: dropoff.lng, lat: dropoff.lat } }) });
+  } catch (e) { say('連不上伺服器，請確認後端有啟動。', 'err'); redraw(); return; }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    say(typeof body.detail === 'string' ? body.detail : '上車點或目的地超出服務範圍，請選在台北市區內。', 'err'); redraw(); return;
+  }
+  const d = await res.json();
+  trip = { tid: d.tid, driver: null, status: 'searching' };
+  steps.length = 0;
+  $('tripCard').hidden = false; $('tripTitle').textContent = `行程 #${d.tid}`;
+  $('tDriver').textContent = '–'; $('tEta').textContent = '–';
+  $('tFare').textContent = `${d.fare} 元` + (d.surge > 1 ? `（尖峰加價 ×${d.surge}）` : '');
+  say(d.surge > 1 ? `這一帶叫車的人多，車資 ×${d.surge}。` : '');
+  step('正在找最近的空車', '先找 1 公里內');
+  // 另開一條只訂閱 ch:trip:{tid} 的連線；地圖那條連線不動
+  tripWs = connectWS(`?tid=${d.tid}&map=0`, onMsg, null);
+  poll = setInterval(refreshTrip, 1500);
+  redraw();
+};
+
+$('rand').onclick = () => {
+  if (!stations.length) return;
+  const pick = () => { const s = stations[Math.floor(Math.random() * stations.length)];
+    return L.latLng(s.lat + (Math.random() - .5) * .006, s.lon + (Math.random() - .5) * .006); };
+  pickup = pick(); dropoff = pick(); say(''); redraw();
+  map.fitBounds(L.latLngBounds([pickup, dropoff]).pad(.4));
+};
+$('clear').onclick = () => { if (trip) return; pickup = dropoff = null; say(''); redraw(); };
+
+fetch('/api/stations').then(r => r.json()).then(s => {
+  stations = s; redraw();
+  // 網址加上 ?auto=1 會自動選一條隨機路線並叫車（錄影或截圖時方便）
+  if (new URLSearchParams(location.search).has('auto')) { $('rand').click(); $('go').click(); }
+});
+connectWS('', onMsg, setConn);
+redraw();
+</script>
+</body>
+</html>

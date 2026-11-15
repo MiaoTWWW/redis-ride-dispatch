@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>監控儀表板｜即時派車模擬系統</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout dash">
+  <div id="map"></div>
+  <aside class="side">
+    <header class="top">
+      <h1>監控儀表板</h1>
+      <a href="/" target="_blank" rel="noopener">開啟乘客端 ↗</a>
+    </header>
+    <div class="conn" id="conn"><i></i><span>連線中…</span></div>
+
+    <section>
+      <div class="tiles">
+        <div class="tile"><b id="kOnline">–</b><span>在線車輛</span></div>
+        <div class="tile"><b id="kFree">–</b><span>空車</span></div>
+        <div class="tile"><b id="kQueue">–</b><span>等待派車</span></div>
+        <div class="tile"><b id="kReq">–</b><span>叫車總數</span></div>
+        <div class="tile"><b id="kMatched">–</b><span>已媒合</span></div>
+        <div class="tile"><b id="kDone">–</b><span>已完成</span></div>
+        <div class="tile"><b id="kWait">–</b><span>平均等車（秒）</span></div>
+        <div class="tile"><b id="kRate">–</b><span>派單成功率</span></div>
+        <div class="tile"><b id="kFail">–</b><span>找不到車</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>車輛狀態</h2>
+      <div class="bar" id="bar"></div>
+      <div class="legend" id="legend"></div>
+    </section>
+
+    <section class="card">
+      <h2>操作</h2>
+      <div class="btns">
+        <button id="b10">模擬 10 筆叫車</button>
+        <button id="b50" class="ghost">模擬 50 筆</button>
+      </div>
+      <label class="chk" style="margin-top:10px"><input type="checkbox" id="surgeOn" checked> 顯示動態加價熱力圖</label>
+      <p class="hint" id="surgeInfo" style="margin-top:4px"></p>
+    </section>
+
+    <section class="card">
+      <h2>每 2 秒叫車數</h2>
+      <canvas class="spark" id="cReq" role="img" aria-label="每 2 秒叫車數折線圖"></canvas>
+      <h2 style="margin-top:10px">平均等車秒數</h2>
+      <canvas class="spark" id="cWait" role="img" aria-label="平均等車秒數折線圖"></canvas>
+    </section>
+
+    <section class="card">
+      <h2>派車服務（Consumer Group）</h2>
+      <table><thead><tr><th>名稱</th><th class="num">處理中</th><th class="num">閒置</th></tr></thead>
+        <tbody id="disp"><tr><td colspan="3" class="empty">還沒有 dispatcher 上線</td></tr></tbody></table>
+      <p class="hint" style="margin-top:6px">閒置超過 10 秒通常代表該視窗已關閉；它留下的請求會被其他 dispatcher 接手。</p>
+    </section>
+
+    <section class="card">
+      <h2>熱門上車點</h2>
+      <div id="hot"><p class="empty">還沒有叫車紀錄</p></div>
+    </section>
+
+    <section class="card">
+      <h2>最近完成的行程</h2>
+      <table><thead><tr><th>#</th><th>司機</th><th class="num">等車</th><th class="num">距離</th><th class="num">車資</th></tr></thead>
+        <tbody id="recent"><tr><td colspan="5" class="empty">還沒有完成的行程</td></tr></tbody></table>
+    </section>
+
+    <section class="card">
+      <h2>即時事件</h2>
+      <ul class="feed" id="feed"><li class="empty">等待事件…</li></ul>
+    </section>
+  </aside>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/static/common.js"></script>
+<script>
+const map = makeMap();
+const cars = new CarLayer(map);
+const surgeLayer = L.layerGroup().addTo(map);
+
+fetch('/api/stations').then(r => r.json()).then(list => {
+  for (const s of list) L.circleMarker([s.lat, s.lon], { radius: 3, color: '#475467', weight: 1, fillColor: '#fff', fillOpacity: 1, interactive: true })
+    .bindTooltip(`捷運 ${s.name}`).addTo(map);
+});
+
+// ── 車輛狀態條 ──
+function drawBar() {
+  const c = cars.counts, total = (c.a + c.o + c.p + c.t) || 1;
+  $('bar').innerHTML = ['a', 'o', 'p', 't'].map(k => `<div style="width:${c[k] / total * 100}%;background:${COLOR[k]}"></div>`).join('');
+  $('legend').innerHTML = ['a', 'o', 'p', 't'].map(k => `<span><i style="background:${COLOR[k]}"></i>${STATUS_NAME[k]} ${c[k]}</span>`).join('');
+}
+
+// ── 即時事件 ──
+const EV_TEXT = {
+  searching: m => `開始找車（1 km${m.surge > 1 ? '，加價 ×' + m.surge : ''}）`,
+  expanding: m => `沒有空車，擴大到 ${m.radius} km`,
+  offered: m => `派給 ${m.driver}，等待接單`,
+  reject: m => `${m.driver} 拒單 → 改派`,
+  timeout: m => `${m.driver} 逾時未接 → 改派`,
+  assigned: m => `${m.driver} 接單（等 ${(m.wait_ms / 1000).toFixed(1)} 秒）`,
+  picked_up: m => `${m.driver} 載到乘客`,
+  completed: m => `完成，車資 ${m.fare} 元`,
+  failed: () => '找不到車',
+  driver_lost: m => `${m.driver} 斷線 → 改派`,
+  aborted: m => `${m.driver} 斷線，行程中止`,
+};
+const feed = [];
+let feedDirty = false;
+function addFeed(m) {
+  const f = EV_TEXT[m.ev]; if (!f) return;
+  feed.unshift({ ev: m.ev, text: `${new Date().toLocaleTimeString('zh-TW', { hour12: false })}  #${m.tid}  ${f(m)}` });
+  if (feed.length > 80) feed.length = 80;
+  feedDirty = true;
+}
+setInterval(() => {   // 壓力測試時事件很多，每 300 ms 才重畫一次
+  if (!feedDirty) return; feedDirty = false;
+  $('feed').innerHTML = feed.map(f => `<li class="e-${f.ev}">${f.text}</li>`).join('');
+}, 300);
+
+connectWS('?feed=1', (m) => {
+  if (m.type === 'map') { cars.update(m.cars); drawBar(); }
+  else if (m.type === 'trip') addFeed(m);
+}, setConn);
+
+// ── 折線圖 ──
+function spark(canvas, data, color, unit) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const vals = data.filter(v => v != null);
+  if (!vals.length) { g.fillStyle = '#98a2b3'; g.font = '12px sans-serif'; g.fillText('等待資料…', 4, h / 2); return; }
+  const max = Math.max(...vals, 1), pad = 4, n = data.length;
+  const x = i => pad + (w - 60 - pad) * (i / Math.max(n - 1, 1)), y = v => h - pad - (h - 2 * pad) * (v / max);
+  g.strokeStyle = '#e4e7ec'; g.beginPath(); g.moveTo(pad, h - pad); g.lineTo(w - 56, h - pad); g.stroke();
+  g.strokeStyle = color; g.lineWidth = 2; g.beginPath();
+  let started = false;
+  data.forEach((v, i) => { if (v == null) return; if (!started) { g.moveTo(x(i), y(v)); started = true; } else g.lineTo(x(i), y(v)); });
+  g.stroke();
+  const last = vals[vals.length - 1];
+  g.fillStyle = '#14181f'; g.font = '600 13px sans-serif'; g.fillText(`${+last.toFixed(1)} ${unit}`, w - 52, 16);
+  g.fillStyle = '#98a2b3'; g.font = '11px sans-serif'; g.fillText(`最高 ${+max.toFixed(1)}`, w - 52, 32);
+}
+const hReq = [], hWait = [];
+let prev = null;
+
+async function refresh() {
+  let d;
+  try { d = await (await fetch('/api/stats')).json(); } catch (e) { return; }
+  const s = d.stats;
+  $('kOnline').textContent = fmt(d.online); $('kFree').textContent = fmt(d.available);
+  $('kQueue').textContent = fmt(d.pending + d.delayed + d.offered);
+  $('kReq').textContent = fmt(s.requests || 0); $('kMatched').textContent = fmt(s.matched || 0);
+  $('kDone').textContent = fmt(s.completed || 0); $('kFail').textContent = fmt(s.failed || 0);
+  $('kWait').textContent = d.avg_wait_s == null ? '–' : d.avg_wait_s.toFixed(1);
+  $('kRate').textContent = d.match_rate == null ? '–' : (d.match_rate * 100).toFixed(1) + '%';
+
+  if (prev) {
+    hReq.push(Math.max(0, (s.requests || 0) - (prev.requests || 0)));
+    const dm = (s.matched || 0) - (prev.matched || 0), dw = (s.total_wait_ms || 0) - (prev.total_wait_ms || 0);
+    hWait.push(dm > 0 ? dw / dm / 1000 : (hWait.length ? hWait[hWait.length - 1] : null));
+    if (hReq.length > 90) { hReq.shift(); hWait.shift(); }
+  }
+  prev = s;
+  spark($('cReq'), hReq, '#2563eb', '筆'); spark($('cWait'), hWait, '#9333ea', '秒');
+
+  $('disp').innerHTML = d.dispatchers.length
+    ? d.dispatchers.map(c => `<tr><td>${c.name}</td><td class="num">${c.pending}</td><td class="num">${c.idle_s} 秒</td></tr>`).join('')
+    : '<tr><td colspan="3" class="empty">還沒有 dispatcher 上線</td></tr>';
+  const top = d.hotspots.length ? d.hotspots[0].count : 1;
+  $('hot').innerHTML = d.hotspots.length
+    ? d.hotspots.map(h => `<div class="hot"><span>${h.name}</span><div style="width:${h.count / top * 100}%"></div><b>${h.count}</b></div>`).join('')
+    : '<p class="empty">還沒有叫車紀錄</p>';
+  $('recent').innerHTML = d.recent.length
+    ? d.recent.map(t => `<tr><td>${t.tid}</td><td>${t.driver}</td><td class="num">${t.wait_s} 秒</td><td class="num">${t.distance_km} km</td><td class="num">${t.fare}${t.surge > 1 ? ' ⚡' : ''}</td></tr>`).join('')
+    : '<tr><td colspan="5" class="empty">還沒有完成的行程</td></tr>';
+}
+
+async function refreshSurge() {
+  surgeLayer.clearLayers();
+  if (!$('surgeOn').checked) { $('surgeInfo').textContent = ''; return; }
+  let cells;
+  try { cells = await (await fetch('/api/surge')).json(); } catch (e) { return; }
+  let n = 0;
+  for (const c of cells) {
+    const [x0, y0, x1, y1] = c.bounds, hot = c.multiplier > 1;
+    if (hot) n++;
+    L.rectangle([[y0, x0], [y1, x1]], { stroke: hot, color: '#dc2626', weight: 1,
+      fillColor: c.multiplier >= 2 ? '#dc2626' : hot ? '#f97316' : '#fbbf24', fillOpacity: hot ? .42 : .16 })
+      .bindTooltip(`最近 60 秒叫車 ${c.demand} 次｜格內空車 ${c.supply} 台｜車資 ×${c.multiplier}`).addTo(surgeLayer);
+  }
+  $('surgeInfo').textContent = cells.length ? `${cells.length} 個格子有人叫車，其中 ${n} 格正在加價。` : '最近 60 秒沒有人叫車。';
+}
+$('surgeOn').onchange = refreshSurge;
+
+async function burst(n, btn) {
+  btn.disabled = true;
+  try { await fetch(`/api/demo/burst?n=${n}`, { method: 'POST' }); } finally { btn.disabled = false; }
+  refresh(); refreshSurge();
+}
+$('b10').onclick = (e) => burst(10, e.currentTarget);
+$('b50').onclick = (e) => burst(50, e.currentTarget);
+
+refresh(); refreshSurge(); drawBar();
+setInterval(refresh, 2000); setInterval(refreshSurge, 3000);
+</script>
+</body>
+</html>

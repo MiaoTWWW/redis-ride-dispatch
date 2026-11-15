@@ -1,0 +1,8 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: dispatch-redis
+    ports:
+      - "6379:6379"
+    # notify-keyspace-events Ex：開啟「key 過期通知」，逾時改派與離線偵測會用到
+    command: ["redis-server", "--notify-keyspace-events", "Ex", "--save", "60", "1"]
