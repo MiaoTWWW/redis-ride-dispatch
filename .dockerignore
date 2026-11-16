@@ -1,0 +1,16 @@
+# 只把執行需要的檔案送進 build context
+*
+!requirements.txt
+!config.py
+!rides.py
+!simulator.py
+!dispatcher.py
+!app.py
+!lua/
+!static/
+!data/
+data/*
+!data/mrt_stations.csv
+!deploy/
+deploy/*
+!deploy/start.sh
